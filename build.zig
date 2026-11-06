@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "kernel",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("kernel.zig"),
+            .root_source_file = b.path("src/kernel.zig"),
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = .riscv32,
                 .os_tag = .freestanding,
