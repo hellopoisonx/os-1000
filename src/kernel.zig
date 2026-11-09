@@ -27,6 +27,7 @@ pub const Process = struct {
         runnable,
     } = .unused,
     sp: common.VAddr = 0,
+    page_table: [*]u32 = undefined,
     stack: [8 * 1024 / 4]u32 = undefined, // 8 KiB 内核栈
 };
 
@@ -338,6 +339,8 @@ comptime {
 
 pub var procs: [procs_max]Process = @splat(.{});
 
+extern const __kernel_base: anyopaque;
+
 fn create_process(pc: u32) *Process {
     for (&procs, 0..) |*p, i| {
         if (p.state != .unused) continue;
@@ -347,9 +350,17 @@ fn create_process(pc: u32) *Process {
         @memset(ctx, 0);
         ctx[0] = pc;
 
+        const page_table: [*]u32 = @ptrFromInt(alloc_pages(1));
+
+        var paddr: common.PAddr = @intFromPtr(@constCast(&__kernel_base));
+        while (paddr < @intFromPtr(&__free_ram_end)) {
+            map_page(page_table, paddr, paddr, page_r | page_w | page_x);
+            paddr += common.page_size;
+        }
         p.pid = i + 1;
         p.state = .runnable;
         p.sp = @intFromPtr(ctx.ptr);
+        p.page_table = page_table;
         return p;
     }
 
@@ -368,11 +379,41 @@ fn yield() void {
     if (next == current_proc) return;
 
     asm volatile (
+        \\sfence.vma
+        \\csrw satp, %[satp]
+        \\sfence.vma
         \\csrw sscratch, %[sscratch]
         :
-        : [sscratch] "r" (&next.stack[next.stack.len - 1]),
+        : [satp] "r" (satp_sv32 | (@intFromPtr(next.page_table) / common.page_size)),
+          [sscratch] "r" (&next.stack[next.stack.len - 1]),
     );
 
     current_proc = next;
     switch_context(&prev.sp, &next.sp);
+}
+
+const satp_sv32: usize = 1 << 31;
+const page_v: usize = 1 << 0;
+const page_r: usize = 1 << 1;
+const page_w: usize = 1 << 2;
+const page_x: usize = 1 << 3;
+const page_u: usize = 1 << 4;
+
+fn map_page(table1: [*]u32, vaddr: u32, paddr: common.PAddr, flags: u32) void {
+    if (vaddr % common.page_size != 0) {
+        common.panic(@src(), "unaligned vaddr %x", .{vaddr});
+    }
+    if (paddr % common.page_size != 0) {
+        common.panic(@src(), "unaligned paddr %x", .{paddr});
+    }
+
+    const vpn1 = (vaddr >> 22) & 0x3ff;
+    if (table1[vpn1] & page_v == 0) {
+        const pt_paddr = alloc_pages(1);
+        table1[vpn1] = (((pt_paddr / common.page_size) << 10)) | page_v;
+    }
+
+    const vpn0 = (vaddr >> 12) & 0x3ff;
+    var table0: [*]u32 = @ptrFromInt((table1[vpn1] >> 10) * common.page_size);
+    table0[vpn0] = ((paddr / common.page_size) << 10) | flags | page_v;
 }
