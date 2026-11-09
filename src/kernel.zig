@@ -15,6 +15,21 @@ const SbiRet = struct {
     value: isize,
 };
 
+const procs_max = 8;
+
+var current_proc: ?*Process = null;
+var idle_proc: ?*Process = null;
+
+pub const Process = struct {
+    pid: usize = 0,
+    state: enum {
+        unused,
+        runnable,
+    } = .unused,
+    sp: common.VAddr = 0,
+    stack: [8 * 1024 / 4]u32 = undefined, // 8 KiB 内核栈
+};
+
 fn sbi_call(
     arg0: isize,
     arg1: isize,
@@ -61,23 +76,48 @@ inline fn clearBss() void {
     _ = common.memset(bss_ptr, 0, bss_len);
 }
 
+var proc_a: *Process = undefined;
+var proc_b: *Process = undefined;
+
+fn delay() void {
+    var i: u32 = 0;
+    while (i < 30_000_000) : (i += 1) {
+        asm volatile ("nop");
+    }
+}
+
+fn proc_a_entry() noreturn {
+    common.printf("starting process A\n", .{});
+    while (true) {
+        putchar('A');
+        yield();
+        delay();
+    }
+}
+
+fn proc_b_entry() noreturn {
+    common.printf("starting process B\n", .{});
+    while (true) {
+        putchar('B');
+        yield();
+        delay();
+    }
+}
+
 export fn kernel_main() callconv(.c) noreturn {
     clearBss();
 
-    const paddr0 = alloc_pages(2);
-    const paddr1 = alloc_pages(1);
-    common.printf("alloc_page test: paddr0=%x\n", .{paddr0});
-    common.printf("alloc_page test: paddr1=%x\n", .{paddr1});
-
     writeCsr("stvec", @intFromPtr(&kernel_entry));
-    asm volatile ("unimp");
 
-    common.printf("\n\nHello %s!\n", .{"World"});
-    common.printf("1 + 2 = %d, %x\n", .{ 1 + 2, 0x1234abcd });
+    idle_proc = create_process(0);
+    idle_proc.?.pid = 0;
+    current_proc = idle_proc;
 
-    while (true) {
-        asm volatile ("wfi");
-    }
+    proc_a = create_process(@truncate(@intFromPtr(&proc_a_entry)));
+    proc_b = create_process(@truncate(@intFromPtr(&proc_b_entry)));
+
+    yield();
+    common.panic(@src(), "switched to idle process", .{});
 }
 
 export fn boot() linksection(".text.boot") callconv(.naked) noreturn {
@@ -92,7 +132,7 @@ export fn boot() linksection(".text.boot") callconv(.naked) noreturn {
 
 export fn kernel_entry() align(4) callconv(.naked) void {
     asm volatile (
-        \\csrw sscratch, sp
+        \\csrrw sp, sscratch, sp
         \\addi sp, sp, -4 * 31
         \\sw ra,  4 * 0(sp)
         \\sw gp,  4 * 1(sp)
@@ -127,6 +167,9 @@ export fn kernel_entry() align(4) callconv(.naked) void {
         \\
         \\csrr a0, sscratch
         \\sw a0, 4 * 30(sp)
+        \\
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0
         \\
         \\mv a0, sp
         \\call handle_trap
@@ -243,4 +286,93 @@ fn alloc_pages(n: u32) common.PAddr {
     _ = common.memset(paddr, 0, n * common.page_size);
 
     return @intFromPtr(paddr);
+}
+
+// naked 函数不能被 Zig 直接调用：导出符号，再按 extern 声明调用
+extern fn switch_context(prev_sp: *u32, next_sp: *u32) void;
+
+noinline fn switchContextNaked(prev_sp: *u32, next_sp: *u32) callconv(.naked) void {
+    _ = prev_sp;
+    _ = next_sp;
+
+    asm volatile (
+        \\addi sp, sp, -13 * 4
+        \\sw ra,  0  * 4(sp)
+        \\sw s0,  1  * 4(sp)
+        \\sw s1,  2  * 4(sp)
+        \\sw s2,  3  * 4(sp)
+        \\sw s3,  4  * 4(sp)
+        \\sw s4,  5  * 4(sp)
+        \\sw s5,  6  * 4(sp)
+        \\sw s6,  7  * 4(sp)
+        \\sw s7,  8  * 4(sp)
+        \\sw s8,  9  * 4(sp)
+        \\sw s9,  10 * 4(sp)
+        \\sw s10, 11 * 4(sp)
+        \\sw s11, 12 * 4(sp)
+        \\
+        \\sw sp, (a0)
+        \\lw sp, (a1)
+        \\
+        \\lw ra,  0  * 4(sp)
+        \\lw s0,  1  * 4(sp)
+        \\lw s1,  2  * 4(sp)
+        \\lw s2,  3  * 4(sp)
+        \\lw s3,  4  * 4(sp)
+        \\lw s4,  5  * 4(sp)
+        \\lw s5,  6  * 4(sp)
+        \\lw s6,  7  * 4(sp)
+        \\lw s7,  8  * 4(sp)
+        \\lw s8,  9  * 4(sp)
+        \\lw s9,  10 * 4(sp)
+        \\lw s10, 11 * 4(sp)
+        \\lw s11, 12 * 4(sp)
+        \\addi sp, sp, 13 * 4
+        \\ret
+    );
+}
+
+comptime {
+    @export(&switchContextNaked, .{ .name = "switch_context" });
+}
+
+pub var procs: [procs_max]Process = @splat(.{});
+
+fn create_process(pc: u32) *Process {
+    for (&procs, 0..) |*p, i| {
+        if (p.state != .unused) continue;
+
+        // switch_context 首次恢复时按这段顺序弹出 ra 与 s0-s11
+        const ctx: []u32 = p.stack[p.stack.len - 13 ..];
+        @memset(ctx, 0);
+        ctx[0] = pc;
+
+        p.pid = i + 1;
+        p.state = .runnable;
+        p.sp = @intFromPtr(ctx.ptr);
+        return p;
+    }
+
+    common.panic(@src(), "no free process slots", .{});
+}
+
+fn yield() void {
+    const prev = current_proc orelse return;
+
+    // 从当前进程之后开始轮转；一圈都没找到可运行进程就回退到 idle
+    const next = for (0..procs_max) |i| {
+        const proc = &procs[(prev.pid + i) % procs_max];
+        if (proc.state == .runnable and proc.pid != 0) break proc;
+    } else (idle_proc orelse return);
+
+    if (next == current_proc) return;
+
+    asm volatile (
+        \\csrw sscratch, %[sscratch]
+        :
+        : [sscratch] "r" (&next.stack[next.stack.len - 1]),
+    );
+
+    current_proc = next;
+    switch_context(&prev.sp, &next.sp);
 }
