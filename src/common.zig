@@ -7,6 +7,12 @@ pub const VAddr = u32;
 
 pub const page_size = 4096;
 
+pub const Sysno = enum(usize) {
+    putchar = 1,
+    getchar = 2,
+    exit = 3,
+};
+
 pub inline fn check_args(args: anytype) void {
     const ArgsType = @TypeOf(args);
     const args_type_info = @typeInfo(ArgsType);

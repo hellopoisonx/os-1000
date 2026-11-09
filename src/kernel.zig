@@ -9,6 +9,12 @@ extern const __bss: anyopaque;
 extern const __bss_end: anyopaque;
 extern const __free_ram: anyopaque;
 extern const __free_ram_end: anyopaque;
+extern const _binary_shell_bin_start: anyopaque;
+extern const _binary_shell_bin_size: anyopaque;
+
+pub const user_base = 0x1000000;
+pub const sstatus_spie = 1 << 5;
+const scause_ecall = 8;
 
 const SbiRet = struct {
     err: isize,
@@ -25,6 +31,7 @@ pub const Process = struct {
     state: enum {
         unused,
         runnable,
+        exited,
     } = .unused,
     sp: common.VAddr = 0,
     page_table: [*]u32 = undefined,
@@ -64,6 +71,11 @@ export fn putchar(ch: u8) void {
     _ = sbi_call(ch, 0, 0, 0, 0, 0, 0, 1);
 }
 
+export fn getchar() isize {
+    const ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+    return ret.err;
+}
+
 inline fn clearBss() void {
     const start_addr = @intFromPtr(&__bss);
     const end_addr = @intFromPtr(&__bss_end);
@@ -76,9 +88,6 @@ inline fn clearBss() void {
     const bss_ptr: [*]u8 = @ptrCast(@constCast(&__bss));
     _ = common.memset(bss_ptr, 0, bss_len);
 }
-
-var proc_a: *Process = undefined;
-var proc_b: *Process = undefined;
 
 fn delay() void {
     var i: u32 = 0;
@@ -110,12 +119,11 @@ export fn kernel_main() callconv(.c) noreturn {
 
     writeCsr("stvec", @intFromPtr(&kernel_entry));
 
-    idle_proc = create_process(0);
+    idle_proc = create_process(null, 0);
     idle_proc.?.pid = 0;
     current_proc = idle_proc;
 
-    proc_a = create_process(@truncate(@intFromPtr(&proc_a_entry)));
-    proc_b = create_process(@truncate(@intFromPtr(&proc_b_entry)));
+    _ = create_process(@constCast(&_binary_shell_bin_start), @intFromPtr(&_binary_shell_bin_size));
 
     yield();
     common.panic(@src(), "switched to idle process", .{});
@@ -210,14 +218,48 @@ export fn kernel_entry() align(4) callconv(.naked) void {
     );
 }
 
-export fn handle_trap(f: *TrapFrame) noreturn {
-    _ = f;
-
+export fn handle_trap(f: *TrapFrame) void {
     const scause = readCsr("scause");
     const stval = readCsr("stval");
-    const sepc = readCsr("sepc");
+    var sepc = readCsr("sepc");
 
-    common.panic(@src(), "unexpected trap scause=%x, stval=%x, sepc=%x", .{ scause, stval, sepc });
+    switch (scause) {
+        scause_ecall => {
+            handle_syscall(f);
+            sepc += 4;
+        },
+        else => {
+            common.panic(@src(), "unexpected trap scause=%x, stval=%x, sepc=%x", .{ scause, stval, sepc });
+        },
+    }
+
+    writeCsr("sepc", sepc);
+}
+
+fn handle_syscall(f: *TrapFrame) void {
+    switch (f.a3) {
+        @backingInt(common.Sysno.putchar) => {
+            putchar(@truncate(f.a0));
+        },
+        @backingInt(common.Sysno.getchar) => {
+            while (true) {
+                const ch = getchar();
+                if (ch >= 0) {
+                    f.a0 = @intCast(ch);
+                    break;
+                }
+
+                yield();
+            }
+        },
+        @backingInt(common.Sysno.exit) => {
+            common.printf("process %d exited\n", .{current_proc.?.pid});
+            current_proc.?.state = .exited;
+            yield();
+            common.panic(@src(), "unreachable", .{});
+        },
+        else => common.panic(@src(), "unexpected syscall a3=%x", .{f.a3}),
+    }
 }
 
 const TrapFrame = packed struct {
@@ -341,14 +383,25 @@ pub var procs: [procs_max]Process = @splat(.{});
 
 extern const __kernel_base: anyopaque;
 
-fn create_process(pc: u32) *Process {
+fn user_entry() callconv(.naked) void {
+    asm volatile (
+        \\csrw sepc, %[sepc]
+        \\csrw sstatus, %[sstatus]
+        \\sret
+        :
+        : [sepc] "r" (user_base),
+          [sstatus] "r" (sstatus_spie),
+    );
+}
+
+fn create_process(image: ?*anyopaque, image_size: usize) *Process {
     for (&procs, 0..) |*p, i| {
         if (p.state != .unused) continue;
 
         // switch_context 首次恢复时按这段顺序弹出 ra 与 s0-s11
         const ctx: []u32 = p.stack[p.stack.len - 13 ..];
         @memset(ctx, 0);
-        ctx[0] = pc;
+        ctx[0] = @intFromPtr(&user_entry);
 
         const page_table: [*]u32 = @ptrFromInt(alloc_pages(1));
 
@@ -357,6 +410,28 @@ fn create_process(pc: u32) *Process {
             map_page(page_table, paddr, paddr, page_r | page_w | page_x);
             paddr += common.page_size;
         }
+
+        if (image) |valid_image| {
+            const image_ptr: [*]u32 = @ptrCast(@alignCast(valid_image));
+            var off: usize = 0;
+            while (off < image_size) {
+                const page = alloc_pages(1);
+                const page_ptr: [*]u32 = @ptrFromInt(page);
+                const remaining = image_size - off;
+                const copy_size = if (remaining >= common.page_size) common.page_size else remaining;
+
+                @memcpy(page_ptr, image_ptr[off .. off + copy_size]);
+                map_page(
+                    page_table,
+                    user_base + off,
+                    page,
+                    page_u | page_r | page_w | page_x,
+                );
+
+                off += common.page_size;
+            }
+        }
+
         p.pid = i + 1;
         p.state = .runnable;
         p.sp = @intFromPtr(ctx.ptr);
