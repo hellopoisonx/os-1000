@@ -24,6 +24,24 @@ pub export fn getchar() isize {
     return @bitCast(syscall(.getchar, 0, 0, 0));
 }
 
+pub export fn readfile(filename: [*:0]const u8, buf: [*]u8, len: usize) isize {
+    return @bitCast(syscall(
+        .readfile,
+        @intCast(@intFromPtr(filename)),
+        @intCast(@intFromPtr(buf)),
+        @intCast(len),
+    ));
+}
+
+pub export fn writefile(filename: [*:0]const u8, buf: [*]const u8, len: usize) isize {
+    return @bitCast(syscall(
+        .writefile,
+        @intCast(@intFromPtr(filename)),
+        @intCast(@intFromPtr(buf)),
+        @intCast(len),
+    ));
+}
+
 pub export fn start() linksection(".text.start") callconv(.naked) noreturn {
     asm volatile (
         \\mv sp, %[stack_top]

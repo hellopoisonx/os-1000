@@ -29,6 +29,20 @@ pub fn build(b: *std.Build) void {
     shell.entry = .disabled; // ENTRY(start) in user.ld
     shell.linker_script = b.path("user.ld");
 
+    const shell_check = b.addExecutable(.{
+        .name = "shell",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shell.zig"),
+            .target = riscv32,
+            .optimize = opt,
+            .stack_protector = false,
+            .stack_check = false,
+            .unwind_tables = .none,
+        }),
+    });
+    shell_check.entry = .disabled; // ENTRY(start) in user.ld
+    shell_check.linker_script = b.path("user.ld");
+
     // shell.elf → shell.bin（原始二进制，从 0x1000000 展开的实际内存内容）
     const objcopy_bin = b.addSystemCommand(&.{
         "llvm-objcopy",
@@ -70,12 +84,34 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addObjectFile(shell_bin_o);
     b.installArtifact(exe);
 
+    const exe_check = b.addExecutable(.{
+        .name = "kernel",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kernel.zig"),
+            .target = riscv32,
+            .optimize = opt,
+            .stack_protector = false,
+            .stack_check = false,
+            .unwind_tables = .none,
+        }),
+    });
+    exe_check.entry = .disabled; // ENTRY(boot) in kernel.ld
+    exe_check.linker_script = b.path("kernel.ld");
+    exe_check.root_module.addObjectFile(shell_bin_o);
+
     // keep intermediates inspectable: shell.elf (symbols) + shell.bin + shell.bin.o
     b.installArtifact(shell);
     const install_shell_bin = b.addInstallFile(shell_bin, "bin/shell.bin");
     const install_shell_bin_o = b.addInstallFile(shell_bin_o, "bin/shell.bin.o");
     b.getInstallStep().dependOn(&install_shell_bin.step);
     b.getInstallStep().dependOn(&install_shell_bin_o.step);
+
+    // disk/ → disk.tar（ustar，QEMU 以 raw 格式挂到 virtio-blk）
+    const tar_disk = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "cd disk && tar cf ../disk.tar --format=ustar *.txt",
+    });
 
     const run_cmd = b.addSystemCommand(&.{
         qemu,
@@ -87,8 +123,22 @@ pub fn build(b: *std.Build) void {
         "-serial",
         "mon:stdio",
         "--no-reboot",
+        "-d",
+        "unimp,guest_errors,int,cpu_reset",
+        "-D",
+        "qemu.log",
+        "-drive",
+        "id=drive0,file=disk.tar,format=raw,if=none",
+        "-device",
+        "virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0",
         "-kernel",
     });
     run_cmd.addArtifactArg(exe);
+    run_cmd.step.dependOn(&tar_disk.step);
     b.step("run", "boot kernel on qemu-riscv32 virt").dependOn(&run_cmd.step);
+
+    exe_check.step.dependOn(&shell_check.step);
+
+    const check = b.step("check", "check if too compoiles");
+    check.dependOn(&exe_check.step);
 }

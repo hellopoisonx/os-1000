@@ -6,6 +6,8 @@ comptime {
     _ = &user.exit;
     _ = &user.putchar;
     _ = &user.getchar;
+    _ = &user.readfile;
+    _ = &user.writefile;
 }
 
 export fn main() void {
@@ -31,7 +33,14 @@ export fn main() void {
 
         if (common.strcmp(&cmdline, "hello") == 0)
             common.printf("Hello world from shell!\n", .{})
-        else if (common.strcmp(&cmdline, "exit") == 0)
+        else if (common.strcmp(&cmdline, "readfile") == 0) {
+            var buf: [128]u8 = undefined;
+            const len = user.readfile("hello.txt", &buf, buf.len);
+            if (len >= 0) common.printf("%s\n", .{buf[0..@intCast(len)]});
+        } else if (common.strcmp(&cmdline, "writefile") == 0) {
+            const text = "Hello from shell!\n";
+            _ = user.writefile("hello.txt", text, text.len);
+        } else if (common.strcmp(&cmdline, "exit") == 0)
             user.exit()
         else
             common.printf("unknown command: %s\n", .{cmdline[0..i :0]});

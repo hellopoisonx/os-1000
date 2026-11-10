@@ -11,6 +11,8 @@ pub const Sysno = enum(usize) {
     putchar = 1,
     getchar = 2,
     exit = 3,
+    readfile = 4,
+    writefile = 5,
 };
 
 pub inline fn check_args(args: anytype) void {
